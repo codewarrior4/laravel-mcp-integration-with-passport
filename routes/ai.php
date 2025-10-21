@@ -5,7 +5,7 @@ use App\Mcp\Servers\WarriorServer;
 use Laravel\Mcp\Facades\Mcp;
 
 // OAuth discovery and client registration routes
-Mcp::oauthRoutes('oauth');
+Mcp::oauthRoutes();
 
 // Public MCP server (no auth)
 Mcp::web('/mcp/warrior', WarriorServer::class);

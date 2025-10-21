@@ -2,13 +2,37 @@
 
 This guide documents the complete setup process for implementing OAuth authentication in a Laravel MCP (Model Context Protocol) server using Laravel Passport.
 
+## ✅ Working Setup
+
+This project has been fully configured and tested with:
+- OAuth 2.0 authentication with PKCE support
+- UUID primary keys for users
+- Session-based web authentication
+- Protected and public MCP endpoints
+- MCP Inspector integration
+
+## Quick Start
+
+If this is already set up, just run:
+
+```bash
+# Start the server
+php artisan serve
+
+# In another terminal, test with MCP Inspector
+php artisan mcp:inspector mcp/admin
+```
+
+**OAuth Credentials:**
+- Check your database for the client ID and secret in `oauth_clients` table
+- Test user: `test@example.com` / `password`
+
 ## Prerequisites
 
 - Laravel 11.x
 - PHP 8.1+
 - MySQL 8.0+
 - Composer
-- Node.js & NPM
 
 ## Step 1: Install Laravel Passport
 
@@ -21,7 +45,7 @@ This command will:
 - Publish and run Passport migrations
 - Generate encryption keys for secure access tokens
 
-## Step 2: Configure User Model
+## Step 2: Configure User Model for UUIDs
 
 Update `app/Models/User.php`:
 
@@ -30,6 +54,7 @@ Update `app/Models/User.php`:
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
 use Laravel\Passport\Contracts\OAuthenticatable;
@@ -37,11 +62,13 @@ use Laravel\Passport\HasApiTokens;
 
 class User extends Authenticatable implements OAuthenticatable
 {
-    use HasApiTokens, Notifiable;
+    use HasApiTokens, Notifiable, HasUuids;
     
     // ... rest of your model
 }
 ```
+
+**Important**: The `HasUuids` trait is required if your users table uses UUID primary keys.
 
 ## Step 3: Configure Authentication Guard
 
@@ -60,7 +87,36 @@ Update `config/auth.php`:
 ],
 ```
 
-## Step 4: Configure CORS
+## Step 4: Fix Passport Migrations for UUIDs
+
+**Critical**: If using UUIDs, update Passport migrations to use `foreignUuid` instead of `foreignId`:
+
+Edit these migration files:
+- `database/migrations/*_create_oauth_auth_codes_table.php`
+- `database/migrations/*_create_oauth_access_tokens_table.php`
+- `database/migrations/*_create_oauth_device_codes_table.php`
+
+Change:
+```php
+$table->foreignId('user_id')->index();
+```
+
+To:
+```php
+$table->foreignUuid('user_id')->index();
+```
+
+Also update `database/migrations/*_create_users_table.php` sessions table:
+```php
+$table->foreignUuid('user_id')->nullable()->index();
+```
+
+Then run migrations:
+```bash
+php artisan migrate:fresh
+```
+
+## Step 5: Configure CORS
 
 CORS (Cross-Origin Resource Sharing) is critical for OAuth flows, especially when the MCP inspector or AI agents run on different origins.
 
@@ -155,7 +211,23 @@ Edit `resources/views/mcp/authorize.blade.php` and replace the `@vite` directive
 </style>
 ```
 
-## Step 8: Configure MCP OAuth Routes
+## Step 8: Fix Authorization View State Parameter
+
+Edit `resources/views/mcp/authorize.blade.php` and update the hidden state inputs:
+
+Change:
+```html
+<input type="hidden" name="state" value="">
+```
+
+To:
+```html
+<input type="hidden" name="state" value="{{ $request->state ?? '' }}">
+```
+
+This is required for both the approve and deny forms.
+
+## Step 9: Configure MCP OAuth Routes
 
 Update `routes/ai.php`:
 
@@ -167,7 +239,7 @@ use App\Mcp\Servers\WarriorServer;
 use Laravel\Mcp\Facades\Mcp;
 
 // OAuth discovery and client registration routes
-Mcp::oauthRoutes('oauth');
+Mcp::oauthRoutes();
 
 // Public MCP server (no auth)
 Mcp::web('/mcp/warrior', WarriorServer::class);
@@ -177,7 +249,7 @@ Mcp::web('/mcp/admin', AdminServer::class)
     ->middleware('auth:api');
 ```
 
-## Step 9: Setup Web Authentication
+## Step 10: Setup Web Authentication
 
 You need a web authentication system for users to login before authorizing OAuth clients.
 
@@ -188,39 +260,125 @@ Create `routes/auth.php`:
 ```php
 <?php
 
+use App\Http\Controllers\Auth\AuthenticatedSessionController;
 use Illuminate\Support\Facades\Route;
 
 Route::middleware('guest')->group(function () {
-    Route::get('login', function () {
-        return view('login');
-    })->name('login');
-    
-    Route::post('login', function (\Illuminate\Http\Request $request) {
-        $credentials = $request->validate([
-            'email' => 'required|email',
-            'password' => 'required',
-        ]);
-        
-        if (auth()->attempt($credentials)) {
-            $request->session()->regenerate();
-            return redirect()->intended('/dashboard');
-        }
-        
-        return back()->withErrors(['email' => 'Invalid credentials']);
-    });
+    Route::get('login', [AuthenticatedSessionController::class, 'create'])->name('login');
+    Route::post('login', [AuthenticatedSessionController::class, 'store']);
 });
 
 Route::middleware('auth')->group(function () {
-    Route::post('logout', function (\Illuminate\Http\Request $request) {
-        auth()->logout();
-        $request->session()->invalidate();
-        $request->session()->regenerateToken();
-        return redirect('/');
-    })->name('logout');
+    Route::get('logout', [AuthenticatedSessionController::class, 'destroy'])->name('logout');
 });
 ```
 
-Create `resources/views/login.blade.php`:
+Create `app/Http/Controllers/Auth/AuthenticatedSessionController.php`:
+
+```php
+<?php
+
+namespace App\Http\Controllers\Auth;
+
+use App\Http\Controllers\Controller;
+use App\Http\Requests\Auth\LoginRequest;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\View\View;
+
+class AuthenticatedSessionController extends Controller
+{
+    public function create(Request $request): View
+    {
+        return view('auth.login');
+    }
+
+    public function store(LoginRequest $request): RedirectResponse
+    {
+        $request->authenticate();
+        $request->session()->regenerate();
+        return redirect()->intended(route('dashboard'));
+    }
+
+    public function destroy(Request $request): RedirectResponse
+    {
+        Auth::guard('web')->logout();
+        $request->session()->invalidate();
+        $request->session()->regenerateToken();
+        return redirect('/');
+    }
+}
+```
+
+Create `app/Http/Requests/Auth/LoginRequest.php`:
+
+```php
+<?php
+
+namespace App\Http\Requests\Auth;
+
+use Illuminate\Auth\Events\Lockout;
+use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
+
+class LoginRequest extends FormRequest
+{
+    public function authorize(): bool
+    {
+        return true;
+    }
+
+    public function rules(): array
+    {
+        return [
+            'email' => ['required', 'string', 'email'],
+            'password' => ['required', 'string'],
+        ];
+    }
+
+    public function authenticate(): void
+    {
+        $this->ensureIsNotRateLimited();
+
+        if (! Auth::attempt($this->only('email', 'password'), $this->boolean('remember'))) {
+            RateLimiter::hit($this->throttleKey());
+            throw ValidationException::withMessages([
+                'email' => trans('auth.failed'),
+            ]);
+        }
+
+        RateLimiter::clear($this->throttleKey());
+    }
+
+    public function ensureIsNotRateLimited(): void
+    {
+        if (! RateLimiter::tooManyAttempts($this->throttleKey(), 5)) {
+            return;
+        }
+
+        event(new Lockout($this));
+        $seconds = RateLimiter::availableIn($this->throttleKey());
+
+        throw ValidationException::withMessages([
+            'email' => trans('auth.throttle', [
+                'seconds' => $seconds,
+                'minutes' => ceil($seconds / 60),
+            ]),
+        ]);
+    }
+
+    public function throttleKey(): string
+    {
+        return Str::transliterate(Str::lower($this->string('email')).'|'.$this->ip());
+    }
+}
+```
+
+Create `resources/views/auth/login.blade.php`:
 
 ```html
 <!DOCTYPE html>
@@ -420,13 +578,46 @@ php artisan mcp:inspector mcp/admin
 - Client ID exists in `oauth_clients` table
 - `redirect_uris` is stored as JSON array: `["http://localhost:6274/oauth/callback"]`
 - Client is not revoked
+- You're using the **plain text** client secret (not the hashed version from database)
 
-### Issue: Login doesn't redirect back to authorization
+### Issue: "invalid_request" - Check the `client_secret` parameter
+
+**Solution**:
+- Make sure you're using the original client secret shown when you created the client
+- The database stores a hashed version - you need the original plain text secret
+- If lost, create a new client: `php artisan passport:client --no-interaction`
+
+### Issue: Login loop - redirects back to login after successful authentication
 
 **Solution**: 
-- Clear sessions: `TRUNCATE TABLE sessions;`
+- **Most common**: Sessions table `user_id` column type mismatch
+  - If using UUIDs: Change `foreignId('user_id')` to `foreignUuid('user_id')` in sessions table migration
+  - Run `php artisan migrate:fresh`
+- Clear sessions: `mysql -u root your_db -e "TRUNCATE TABLE sessions;"`
 - Clear caches: `php artisan optimize:clear`
 - Ensure `SESSION_DRIVER=database` in `.env`
+
+### Issue: "The request is missing a required parameter" during OAuth authorization
+
+**Solution**:
+- Check that the `state` parameter is being passed in the authorization form
+- Update `resources/views/mcp/authorize.blade.php`:
+  ```html
+  <input type="hidden" name="state" value="{{ $request->state ?? '' }}">
+  ```
+
+### Issue: UUID compatibility errors / "Invalid user_id"
+
+**Solution**:
+- **Critical**: All foreign keys referencing `users.id` must use `foreignUuid()` if users table uses UUIDs
+- Update these migrations:
+  - `*_create_oauth_auth_codes_table.php`
+  - `*_create_oauth_access_tokens_table.php`
+  - `*_create_oauth_device_codes_table.php`
+  - `*_create_users_table.php` (sessions table)
+  - `*_create_transactions_table.php` (if exists)
+- Add `HasUuids` trait to User model
+- Run `php artisan migrate:fresh`
 
 ### Issue: "Failed to fetch" error on authorization
 
@@ -434,12 +625,6 @@ php artisan mcp:inspector mcp/admin
 - Remove `@vite` directive from authorize view
 - Use inline CSS instead
 - Disable JavaScript in authorize view if needed
-
-### Issue: UUID compatibility errors
-
-**Solution**:
-- If using UUIDs, ensure all Passport migrations use `uuid()` or `string(36)` for `user_id` columns
-- Or remove `HasUuids` trait from User model if using bigint IDs
 
 ### Issue: CORS errors in browser console
 
